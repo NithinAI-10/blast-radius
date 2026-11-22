@@ -123,6 +123,30 @@ fresh batch of 40 (`ONLY_NAME=arg_types tools/gen_dict_mutants.py`, seed 31, lab
 running every candidate of the previous analysis): no missed failing test; 24 of the
 40 broke at least one test.
 
+## Class-level constants
+
+Dialects, parsers, generators and tokenizers are configured by class-level constants
+(`SAFE_DIVISION = True`, `WEEK_OFFSET = -1`, ...). Each dialect sets its own, and a
+lookup on a dialect resolves to the nearest class that defines the name, so a change to
+one class's constant matters only to tests whose lookups reach that class's value.
+
+`tools/trace_attrs.py` hooks class creation before sqlglot is imported and puts each
+such constant into its class as a descriptor that records the read and returns the same
+value, keyed by the defining class (`module:Qualname.NAME`). Reads by metaclasses,
+`__init_subclass__` and any code run while importing (such as constants parsed at
+import with the default dialect) are recorded separately, and those keys are never
+narrowed, nor are constants their own class body reads by bare name (that read happens
+before the descriptor exists). Enums and the four modules with dataclasses or
+NamedTuples are not instrumented, and only instrumented constants are narrowed. All
+1620 tests pass under the trace.
+
+When a patch changes only the value of one such constant (a literal or a signed
+number), the candidates are the tests that read that class's value.
+
+**Validation.** 26 such commits in our labeled mutant batches, and a fresh batch of 50
+(`tools/gen_attr_mutants.py`, seed 41, labeled by running every candidate of the
+previous analysis; 38 broke at least one test): no missed failing test.
+
 ## Failure priors and the planner
 
 **What the priors are.** `map.bin` holds one number per test: how likely that test is

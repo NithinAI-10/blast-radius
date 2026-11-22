@@ -152,6 +152,13 @@ if os.path.isdir(rq_dir):
 
     data["argtypes"] = build_required.build(os.environ.get("BR_REPO", "/home/claude/sqlglot"), rq_dir, {t["number"]: t["number"] for t in tests})
 
+at_dir = os.path.join(os.path.dirname(raw_dir), "attrs")
+if os.path.isdir(at_dir):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import build_attrs
+
+    data["attrs"] = build_attrs.build(os.environ.get("BR_REPO", "/home/claude/sqlglot"), at_dir, {t["number"]: t["number"] for t in tests})
+
 pf_path = os.path.join(os.path.dirname(raw_dir), "pfail.json")
 if os.path.exists(pf_path):
     data["pfail"] = {int(k): v for k, v in json.load(open(pf_path)).items()}

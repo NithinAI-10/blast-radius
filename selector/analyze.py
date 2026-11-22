@@ -280,6 +280,7 @@ class Ctx:
         self.coarse = False  # some change is not tied to specific runtime lines
         self.kinds = set()  # kinds of change seen (runtime, weak, class-attr, data, ...)
         self.dict_changes = {}  # path -> {statement line: (name, {key labels})}
+        self.attr_changes = {}  # path -> {statement line: "module:Qualname.NAME"}
         self.argtypes_changes = {}  # path -> {statement line: (class, {arg: (old, new required)})}
 
 
@@ -353,6 +354,15 @@ def analyze_location(M, path, idx: PyIndex, line, c0, c1, ctx: Ctx, insertion=Fa
         return
 
     cls_bits = _class_bits(M, path, idx, anc)
+    ak = ctx.attr_changes.get(path, {}).get(stmt.lineno) if stmt is not None else None
+    am = M.get("attrs")
+    if cls_bits is not None and ak is not None and am is not None and ak in am["keys"] and ak not in am["unsafe"]:
+        # a class-level constant: tests whose lookups resolved to this class's own value
+        b = am["read"].get(ak, 0) | am["failed"]
+        ctx.bits |= b
+        ctx.spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
+        ctx.why.append(f"{path}:{line} class-const {ak.split(':', 1)[1]} n={b.bit_count()}")
+        return
     at = ctx.argtypes_changes.get(path, {}).get(stmt.lineno) if stmt is not None else None
     atm = M.get("argtypes")
     if cls_bits is not None and at is not None and atm is not None and atm["ok"]:
@@ -691,6 +701,52 @@ def argtypes_changes(old_tree, new_tree):
     return out
 
 
+def _class_scalars(tree):
+    """{(class path, name): Assign/AnnAssign node} for NAME = <constant> in class bodies."""
+    out = {}
+    stack = [((), n) for n in tree.body if isinstance(n, ast.ClassDef)]
+    while stack:
+        path, cls = stack.pop()
+        here = path + (cls.name,)
+        for st in cls.body:
+            if isinstance(st, ast.ClassDef):
+                stack.append((here, st))
+            elif isinstance(st, (ast.Assign, ast.AnnAssign)) and _const_like(st.value):
+                targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+                if len(targets) == 1 and isinstance(targets[0], ast.Name):
+                    out[(here, targets[0].id)] = st
+    return out
+
+
+def _const_like(v):
+    """A constant, or a signed number such as -1."""
+    if isinstance(v, ast.UnaryOp) and isinstance(v.op, (ast.USub, ast.UAdd)):
+        v = v.operand
+    return isinstance(v, ast.Constant) and isinstance(v.value, (bool, int, float, str, type(None)))
+
+
+def scalar_attr_changes(old_tree, new_tree, module):
+    """{old statement line: "module:Qualname.NAME"} for class-level NAME = <constant>
+    whose constant changed and nothing else in the statement did."""
+    out = {}
+    try:
+        new = _class_scalars(new_tree)
+        for key, ost in _class_scalars(old_tree).items():
+            nst = new.get(key)
+            if nst is None or not _const_like(nst.value):
+                continue
+            if type(ost) is not type(nst):
+                continue
+            if isinstance(ost, ast.AnnAssign) and ast.dump(ost.annotation) != ast.dump(nst.annotation):
+                continue
+            if ast.dump(ost.value) == ast.dump(nst.value):
+                continue
+            out[ost.lineno] = f"{module}:{'.'.join(key[0])}.{key[1]}"
+    except Exception:  # noqa: BLE001
+        return {}
+    return out
+
+
 def analyze_py(M, path, old_src, new_src, removed, gaps, pairs, ctx: Ctx):
     if tokens_equal(old_src, new_src) and not (_coding_line(new_src) != _coding_line(old_src)):
         ctx.why.append(f"{path} comments-only")
@@ -716,6 +772,10 @@ def analyze_py(M, path, old_src, new_src, removed, gaps, pairs, ctx: Ctx):
         try:
             ntree = ast.parse(new_src)
             ctx.dict_changes[path] = dict_entry_changes(idx.tree, ntree)
+            if M.get("attrs") is not None and path.startswith("sqlglot/") and path.endswith(".py"):
+                mod = path[:-3].replace("/", ".")
+                mod = mod[:-9] if mod.endswith(".__init__") else mod
+                ctx.attr_changes[path] = scalar_attr_changes(idx.tree, ntree, mod)
             if M.get("argtypes") is not None and path.startswith("sqlglot/"):
                 ctx.argtypes_changes[path] = argtypes_changes(idx.tree, ntree)
         except SyntaxError:
