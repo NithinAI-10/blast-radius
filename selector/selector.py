@@ -76,6 +76,77 @@ def partition(ms):
     return best
 
 
+def approx_partition(heavy_ms, small_ms):
+    """partition() cost with the small tests treated as filler poured into the emptiest workers"""
+    if not heavy_ms and small_ms <= 0:
+        return 0.0
+    hs = sorted(heavy_ms, reverse=True)
+    total = sum(hs) + small_ms
+    best = None
+    for k in range(1, 9):
+        loads = [0] * k
+        for d in hs:
+            j = loads.index(min(loads))
+            loads[j] += d
+        cost = max(max(loads), total / k) + WORKER_MS * k
+        if best is None or cost < best:
+            best = cost
+        if hs and k >= len(hs) and small_ms <= 0:
+            break
+    return best / 1000
+
+
+def marginal_plan(cand, cost_run, p_eff, dur_ms, cls_of, cls_setup, heavy_n=12):
+    """Greedy: verify the heavy tests (and optionally the whole block of small ones) whose
+    expected drop in the worker schedule beats their verification CPU. Returns (est, run)."""
+    srt = sorted(cand, key=lambda n: -dur_ms[n])
+    heavy = [n for n in srt[:heavy_n] if dur_ms[n] >= 200]
+    hset = set(heavy)
+    small = [n for n in cand if n not in hset]
+    small_ms = sum(dur_ms[n] for n in small)
+    small_run = sum(cost_run[n] + p_eff(n) * dur_ms[n] / 1000 for n in small)
+    small_cls = {cls_of(n) for n in small}
+    small_pass = 1.0
+    for n in small:
+        small_pass *= 1 - p_eff(n)
+    best_all = None
+    for vs in (False, True):
+        chosen = []
+        def est(ch):
+            classes = {cls_of(n) for n in ch} | (small_cls if vs else set())
+            e = CHILD_OVERHEAD if (ch or vs) else 0.0
+            e += sum(cost_run[n] + p_eff(n) * dur_ms[n] / 1000 for n in ch)
+            e += sum(cls_setup.get(c, 0.0) for c in classes)
+            if vs:
+                e += small_run
+            rest_h = [dur_ms[n] for n in heavy if n not in ch]
+            rest_s = 0 if vs else small_ms
+            e += approx_partition(rest_h, rest_s)
+            if not rest_h and rest_s <= 0:
+                ap = small_pass if vs else 1.0
+                for n in ch:
+                    ap *= 1 - p_eff(n)
+                e += (1 - ap) * WORKER_MS / 1000
+            return e
+        cur = est(chosen)
+        while True:
+            step = None
+            for n in heavy:
+                if n in chosen:
+                    continue
+                v = est(chosen + [n])
+                if v < cur - 1e-9 and (step is None or v < step[0]):
+                    step = (v, n)
+            if step is None:
+                break
+            cur = step[0]
+            chosen.append(step[1])
+        run = chosen + (small if vs else [])
+        if best_all is None or cur < best_all[0]:
+            best_all = (cur, run)
+    return best_all
+
+
 def bits_to_list(b):
     out = []
     while b:
@@ -244,18 +315,8 @@ def main():
             if n == sc_num and p["shortcut"]:
                 # parse+optimize of the chosen queries (~11% of the test) plus some re-execution
                 cost_run[n] = 1.4 + 0.11 * cost_run[n] + 1.0
-        # failure odds depend on the kind of change (measured on 230 labeled commits)
-        kinds = p["ctx"].kinds if p["ctx"] is not None else set()
-        code_kinds = kinds - {"data", "comments-only", "docstring"}
-        if "data" in kinds and not code_kinds:
-            kind_factor = None  # fixture edits: the reading tests nearly always fail
-        else:
-            kind_factor = 1.0
-
         def p_eff(n):
-            if kind_factor is None:
-                return 0.98
-            return min(0.98, pfail.get(rt_to_idx.get(n), P_FAIL) * kind_factor)
+            return min(0.98, pfail.get(rt_to_idx.get(n), P_FAIL))
 
         # run tests in order of run-cost per listed second, keep the best prefix
         order = sorted(cand, key=lambda n: (cost_run[n] / max(dur_ms[n] / 1000, 0.001), cost_run[n]))
@@ -280,7 +341,13 @@ def main():
                 if est < best[0]:
                     best = (est, k + 1)
         run = order[: best[1]]
-        p["out"] = order[best[1]:]
+        if p["files"] is not None and not NO_RUN and len(cand) > 1:
+            alt = marginal_plan(cand, cost_run, p_eff, dur_ms, cls_of, cls_setup)
+            if alt is not None and alt[0] < best[0] - 0.05:
+                best = (alt[0], -1)
+                run = alt[1]
+        runset = set(run)
+        p["out"] = [n for n in order if n not in runset]
         p["est"] = best[0]
         # jobs: one child for unrestricted tests plus restricted ones; a second
         # child for unrestricted tests that load a fixture we restricted

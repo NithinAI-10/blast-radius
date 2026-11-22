@@ -16,7 +16,7 @@ def list_py():
     return sorted(out)
 refs=analyze.RefIndex(M,rd,list_py)
 SK={x['number'] for x in tests if x['id'].split('::')[-1] in ('test_max_nodes','test_execute_tpcds','test_generator_memory')}
-sets=[('/home/claude/kit/sample/answers.json','/home/claude/kit/sample/commits')]
+sets=[] if __import__('os').environ.get('NO_SAMPLE') else [('/home/claude/kit/sample/answers.json','/home/claude/kit/sample/commits')]
 if len(sys.argv)>1: sets.append((sys.argv[1],sys.argv[2]))
 nc=collections.Counter(); nf=collections.Counter(); commits_any=0; commits=0
 for ansf,cdir in sets:

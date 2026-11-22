@@ -67,7 +67,31 @@ costly to verify), packed onto the worker count that minimises each commit's cos
    are replaced by an in-process pool that still pickles arguments and
    results. Anything that fails, errors, times out or never reports is printed.
    Whether to verify or just list is decided per commit from measured CPU per
-   test (`tools/measure_cpu.py`) and a per-test failure prior (`tools/calib.py`).
+   test (`tools/measure_cpu.py`) and a per-test failure prior (below).
+
+## Failure priors and the planner
+
+**What the priors are.** `map.bin` holds one number per test: how likely that test is
+to fail *when it is a candidate*. It is keyed by test only: no patch, file, line or
+kind of edit appears in it, and it never decides which tests are listed, only whether
+listing or verifying a candidate is cheaper.
+
+**How they were generated.** `tools/gen_mutants.py` wrote 120 mutants of the pinned
+sqlglot (operator swaps, constant changes, comment and fixture edits; seed 7). Each was
+labeled by running the pinned test suite against it (`tools/label.py`). Then
+`NO_SAMPLE=1 python tools/calib.py <those 120 labels>` ran our own candidate analysis on
+each mutant and, per test, smoothed failures / candidacies toward a size prior
+(`p = (fails + 4·p0) / (candidacies + 4)`, `p0` = 0.35 for tests over 0.3 s, else 0.06;
+fixed `p0` for the three slowest tests, which the labels skip). The organizers'
+sample answers and our second, held-out mutant batch were not used.
+
+**How the planner uses them.** For each commit the selector estimates the cost of
+listing every candidate (`partition`) against verifying some of them:
+verification CPU + the prior × the listed seconds of each verified test (it is
+listed anyway if it fails) + the schedule of what is left. It takes the cheaper of
+two plans: the best prefix of candidates ordered by CPU per listed second, and a
+greedy plan over the heaviest tests plus the block of small ones, which counts how
+much the actual worker schedule shrinks when each is verified and passes.
 
 ## Dependencies
 
