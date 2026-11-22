@@ -145,6 +145,13 @@ if os.path.isdir(dk_dir):
     repo_dir = os.environ.get("BR_REPO", "/home/claude/sqlglot")  # the pinned checkout
     data["dk"] = build_dictkeys.build(repo_dir, dk_dir, {t["number"]: t["number"] for t in tests})
 
+rq_dir = os.path.join(os.path.dirname(raw_dir), "required")
+if os.path.isdir(rq_dir):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import build_required
+
+    data["argtypes"] = build_required.build(os.environ.get("BR_REPO", "/home/claude/sqlglot"), rq_dir, {t["number"]: t["number"] for t in tests})
+
 pf_path = os.path.join(os.path.dirname(raw_dir), "pfail.json")
 if os.path.exists(pf_path):
     data["pfail"] = {int(k): v for k, v in json.load(open(pf_path)).items()}

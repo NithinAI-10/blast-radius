@@ -280,6 +280,7 @@ class Ctx:
         self.coarse = False  # some change is not tied to specific runtime lines
         self.kinds = set()  # kinds of change seen (runtime, weak, class-attr, data, ...)
         self.dict_changes = {}  # path -> {statement line: (name, {key labels})}
+        self.argtypes_changes = {}  # path -> {statement line: (class, {arg: (old, new required)})}
 
 
 def analyze_location(M, path, idx: PyIndex, line, c0, c1, ctx: Ctx, insertion=False, flip=False):
@@ -352,6 +353,22 @@ def analyze_location(M, path, idx: PyIndex, line, c0, c1, ctx: Ctx, insertion=Fa
         return
 
     cls_bits = _class_bits(M, path, idx, anc)
+    at = ctx.argtypes_changes.get(path, {}).get(stmt.lineno) if stmt is not None else None
+    atm = M.get("argtypes")
+    if cls_bits is not None and at is not None and atm is not None and atm["ok"]:
+        # arg_types values only decide required_args, which only error_messages reads:
+        # tests that validated an affected class while a flipped arg was missing
+        cname, flips = at
+        args = [k for k, (o, n) in flips.items() if o != n]
+        classes = set(atm["derived"].get(cname, [cname])) | set(atm["derived"].get("*", ())) | {cname}
+        b = atm["failed"]
+        for c in classes:
+            for k in args:
+                b |= atm["missing"].get(f"{c}.{k}", 0)
+        ctx.bits |= b
+        ctx.spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
+        ctx.why.append(f"{path}:{line} arg-types {cname}[{','.join(args)}] n={b.bit_count()}")
+        return
     de = ctx.dict_changes.get(path, {}).get(stmt.lineno) if stmt is not None else None
     dk = M.get("dk")
     if cls_bits is not None and de is not None and dk is not None:
@@ -640,6 +657,40 @@ def dict_entry_changes(old_tree, new_tree):
     return out
 
 
+def argtypes_changes(old_tree, new_tree):
+    """{old statement line: (class name, {arg: (old required, new required)})} for
+    arg_types dict literals whose keys are unchanged and whose changed values are all
+    constants (required-ness is their truth value)."""
+    out = {}
+    try:
+        new = _class_dicts(new_tree)
+        for key, ost in _class_dicts(old_tree).items():
+            if key[1] != "arg_types":
+                continue
+            nst = new.get(key)
+            if nst is None:
+                continue
+            od, nd = ost.value, nst.value
+            if len(od.keys) != len(nd.keys):
+                continue
+            flips, ok = {}, True
+            for ok_, nk, ov, nv in zip(od.keys, nd.keys, od.values, nd.values):
+                if (ok_ is None) != (nk is None) or (ok_ is not None and ast.dump(ok_) != ast.dump(nk)):
+                    ok = False
+                    break
+                if ast.dump(ov) == ast.dump(nv):
+                    continue
+                if not (isinstance(ok_, ast.Constant) and isinstance(ov, ast.Constant) and isinstance(nv, ast.Constant)):
+                    ok = False
+                    break
+                flips[str(ok_.value)] = (bool(ov.value), bool(nv.value))
+            if ok and flips:
+                out[ost.lineno] = (key[0][-1], flips)
+    except Exception:  # noqa: BLE001
+        return {}
+    return out
+
+
 def analyze_py(M, path, old_src, new_src, removed, gaps, pairs, ctx: Ctx):
     if tokens_equal(old_src, new_src) and not (_coding_line(new_src) != _coding_line(old_src)):
         ctx.why.append(f"{path} comments-only")
@@ -663,7 +714,10 @@ def analyze_py(M, path, old_src, new_src, removed, gaps, pairs, ctx: Ctx):
 
     if M.get("dk") is not None:
         try:
-            ctx.dict_changes[path] = dict_entry_changes(idx.tree, ast.parse(new_src))
+            ntree = ast.parse(new_src)
+            ctx.dict_changes[path] = dict_entry_changes(idx.tree, ntree)
+            if M.get("argtypes") is not None and path.startswith("sqlglot/"):
+                ctx.argtypes_changes[path] = argtypes_changes(idx.tree, ntree)
         except SyntaxError:
             pass
     paired = {p[0] for p in pairs}

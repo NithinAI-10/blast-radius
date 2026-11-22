@@ -1,11 +1,12 @@
 """Mutants that change one constant inside one entry of a class-level dict literal.
-Usage: python gen_dict_mutants.py REPO OUT_DIR N SEED [DK_PICKLE]"""
+Usage: [ONLY_NAME=arg_types] python gen_dict_mutants.py REPO OUT_DIR N SEED [DK_PICKLE]"""
 import ast, difflib, json, os, pickle, random, sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "selector"))
 REPO, OUT, N, SEED = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
 from analyze import _class_dicts, _key_label
 dk = pickle.load(open(sys.argv[5], "rb")) if len(sys.argv) > 5 else {"unsafe": set(), "unsafe_keys": {}}
 rng = random.Random(SEED)
+ONLY = os.environ.get("ONLY_NAME")
 sites = []
 for dp, dn, fn in os.walk(os.path.join(REPO, "sqlglot")):
     for f in fn:
@@ -18,11 +19,13 @@ for dp, dn, fn in os.walk(os.path.join(REPO, "sqlglot")):
         except SyntaxError:
             continue
         for (cp, name), st in _class_dicts(tree).items():
-            if name in dk["unsafe"]:
+            if ONLY and name != ONLY:
+                continue
+            if not ONLY and name in dk["unsafe"]:
                 continue
             for k, v in zip(st.value.keys, st.value.values):
                 lb = _key_label(k) if k is not None else None
-                if lb is None or lb in dk["unsafe_keys"].get(name, ()):
+                if lb is None or (not ONLY and lb in dk["unsafe_keys"].get(name, ())):
                     continue
                 for c in ast.walk(v):
                     if isinstance(c, ast.Constant) and c.lineno == c.end_lineno and c.value is not None and not isinstance(c.value, bytes):

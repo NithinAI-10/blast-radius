@@ -101,6 +101,28 @@ against it; the in-body rule above came from the first batch. On the second batc
 of 50 were narrowed, 39 broke at least one test, and none missed a failing test. The
 two official-sample commits of this kind go from 273 and 32 candidates to 1 and 0.
 
+## Required-argument flags
+
+An expression class's `arg_types` maps each argument to whether it is required. Its
+values are read in exactly one place: when the class is created, to build
+`required_args`, which only `Expression.error_messages` uses, to report a required
+argument that is missing (`tools/build_required.py` checks this on the source and
+disables the rule otherwise). So flipping `arg_types[k]` of a class can only change a
+test that validates an instance of an affected class while `k` is missing.
+
+`tools/trace_required.py` records, per test, every (class, argument) that was missing
+whenever `error_messages` ran. The affected classes are the class itself, subclasses
+that inherit its `arg_types`, and classes whose `arg_types` copies it with
+`{**X.arg_types, ...}`, transitively. When a patch changes only constants among the
+values of one `arg_types` literal, the candidates are the tests that validated an
+affected class with a flipped argument missing; a value change that keeps the same
+truth value selects nothing. All 1620 tests pass under the trace.
+
+**Validation.** 18 such commits in our two labeled mutant batches and the sample, and a
+fresh batch of 40 (`ONLY_NAME=arg_types tools/gen_dict_mutants.py`, seed 31, labeled by
+running every candidate of the previous analysis): no missed failing test; 24 of the
+40 broke at least one test.
+
 ## Failure priors and the planner
 
 **What the priors are.** `map.bin` holds one number per test: how likely that test is
