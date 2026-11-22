@@ -81,7 +81,10 @@ costly to verify), packed onto the worker count that minimises each commit's cos
    are replaced by an in-process pool that still pickles arguments and
    results. Anything that fails, errors, times out or never reports is printed.
    Whether to verify or just list is decided per commit from measured CPU per
-   test (`tools/measure_cpu.py`) and a per-test failure prior (below).
+   test (`tools/measure_cpu.py`) and a per-test failure prior (below). Verification only needs to know whether a test fails, so it stops at
+   the first failure: a failing sub-check (`subTest`) ends its test (a skipped one stays
+   skipped), and the executor tests run each query only when its result is compared,
+   so the first wrong result ends the test.
 
 ## Lookup-table entries
 
@@ -217,7 +220,7 @@ greedy plan over the heaviest tests plus the block of small ones, which counts h
 much the actual worker schedule shrinks when each is verified and passes.
 
 Every verification cost the planner weighs (test CPU, class setup, per-child overhead)
-is multiplied by `CPU_SCALE` (1.2), set from practice-board runs of this same selector at
+is multiplied by `CPU_SCALE` (0.8), set from practice-board runs of this same selector at
 different values (a diagnostic run that verified nearly everything showed how much
 listed time verification can remove).
 

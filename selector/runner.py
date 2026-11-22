@@ -62,6 +62,19 @@ def child_main(root: str, groups: list[tuple[str, str, list[tuple[int, str]]]], 
     import syncpool
 
     syncpool.install()
+    if not os.environ.get("BR_NO_FAILFAST"):
+        # We only need to know whether a test fails, so a failing sub-check ends the test
+        # (the test's outcome is the same). A skipped sub-check is still only skipped.
+        import contextlib
+
+        @contextlib.contextmanager
+        def _fail_fast_subtest(self, msg=None, **params):
+            try:
+                yield
+            except unittest.SkipTest:
+                pass
+
+        unittest.TestCase.subTest = _fail_fast_subtest
     fp = None
     devnull = os.open(os.environ.get("BR_CHILD_LOG", os.devnull), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
     os.dup2(devnull, 1)
@@ -162,6 +175,13 @@ def child_main(root: str, groups: list[tuple[str, str, list[tuple[int, str]]]], 
             if fp is not None:
                 fp.patch_module(mod)
             cls = getattr(mod, clsname)
+            if modname == "tests.test_executor" and not os.environ.get("BR_NO_FAILFAST"):
+                # run each query when its result is compared, so the first wrong result stops the test
+                import tpcds_shortcut
+
+                tpcds_shortcut.FAILED = False
+                if getattr(mod, "ProcessPoolExecutor", None) is not tpcds_shortcut.LazyPool:
+                    mod.ProcessPoolExecutor = tpcds_shortcut.LazyPool
             if calls and any(num in calls for num, _ in items):
                 import callskip
 
