@@ -48,6 +48,13 @@ DEFAULT_RATIO = 1.15
 # Every verification cost the planner weighs is multiplied by this.
 CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "2.0"))
 FIXTURE_PRIOR = (31 + 4 * 0.5) / (32 + 4)
+# test_execute_tpcds when the shortcut applies: 0 of the 3 such development mutants failed it;
+# smoothed like the per-test priors, (0 + 4 * 0.35) / (3 + 4)
+SC_PRIOR = (0 + 4 * 0.35) / (3 + 4)
+# s CPU of test_execute_tpcds under the shortcut: parsing, transpiling, optimizing all queries
+SC_BASE = float(os.environ.get("BR_SC_BASE", "1.6"))
+SC_OPT = float(os.environ.get("BR_SC_OPT", "3.4"))
+SC_TR = float(os.environ.get("BR_SC_TR", "0.5"))
 P_FAIL = float(os.environ.get("BR_PFAIL", "0.2"))  # chance a verified candidate fails and gets listed anyway
 
 PRINTED = set()
@@ -120,13 +127,17 @@ def marginal_plan(cand, cost_run, p_eff, dur_ms, cls_of, cls_setup, heavy_n=12):
         def est(ch):
             classes = {cls_of(n) for n in ch} | (small_cls if vs else set())
             e = CHILD_OVERHEAD * CPU_SCALE if (ch or vs) else 0.0
-            e += sum(cost_run[n] + p_eff(n) * dur_ms[n] / 1000 for n in ch)
+            e += sum(cost_run[n] for n in ch)
             e += sum(cls_setup.get(c, 0.0) for c in classes)
             if vs:
                 e += small_run
             rest_h = [dur_ms[n] for n in heavy if n not in ch]
             rest_s = 0 if vs else small_ms
-            e += approx_partition(rest_h, rest_s)
+            base = approx_partition(rest_h, rest_s)
+            e += base
+            # a verified test that fails is listed: expected growth of the schedule
+            for n in ch:
+                e += p_eff(n) * max(0.0, approx_partition(rest_h + [dur_ms[n]], rest_s) - base)
             if not rest_h and rest_s <= 0:
                 ap = small_pass if vs else 1.0
                 for n in ch:
@@ -286,20 +297,41 @@ def main():
         chosen = sum(len(v) for v in rs.values())
         return full * (0.2 + 0.8 * chosen / total)
 
-    sc = M.get("tpcds_sc")
+    sc = M.get("tpcds_sc2")
     sc_num = rt_by_id[sc["test"]]["number"] if sc and sc["test"] in rt_by_id else None
 
+    def shortcut_need(p, phase):
+        """True if a changed line (or a read of a changed attribute/constant) runs in phase."""
+        lines = sc[phase]
+        defs = {(path, span.start, span.stop) for path, span in p["ctx"].def_spans}
+        for path, span in list(p["ctx"].spans) + list(p["ctx"].read_spans):
+            if (path, span.start, span.stop) in defs:
+                continue
+            ls = lines.get(path, ())
+            if any(ln in ls for ln in span):
+                return True
+        return False
+
     def shortcut_ok(p):
-        """True if every changed line this patch can reach runs, for test_execute_tpcds,
-        only inside parse/optimize (so unchanged optimized plans imply unchanged runs)."""
+        """True if no changed line this patch can reach runs, for test_execute_tpcds, outside
+        parse_one/optimize/transpile; for a changed attribute or constant, no line reading it
+        does. Then identical parsed inputs, plans and duckdb SQL imply an identical run."""
         ctx = p["ctx"]
         if sc_num is None or ctx is None or ctx.coarse or p["files"] is None:
             return False
-        if any(f.startswith("tests/") and f.endswith(".py") for f in p["files"]):
+        if any(not (f.startswith("sqlglot/") and f.endswith(".py")) for f in p["files"]):
             return False
+        resid = sc["resid"]
+        defs = {(path, span.start, span.stop) for path, span in ctx.def_spans}
         for path, span in ctx.spans:
-            pb = sc["phaseB"].get(path, ())
-            if any(ln in pb for ln in span):
+            if (path, span.start, span.stop) in defs:
+                continue  # the value flows only through its reads, checked below
+            rs = resid.get(path, ())
+            if any(ln in rs for ln in span):
+                return False
+        for path, span in ctx.read_spans:
+            rs = resid.get(path, ())
+            if any(ln in rs for ln in span):
                 return False
         return True
 
@@ -318,8 +350,11 @@ def main():
             else:
                 cost_run[n] = cpu_of(n)
             if n == sc_num and p["shortcut"]:
-                # parse+optimize of the chosen queries (~11% of the test) plus some re-execution
-                cost_run[n] = 1.4 + 0.11 * cost_run[n] + 1.0
+                # parse every query (the test does), transpile/optimize them only when the
+                # change can reach those phases, and re-run the queries whose plans changed
+                p["sc_need"] = (shortcut_need(p, "O"), shortcut_need(p, "T"))
+                c = SC_BASE + (SC_OPT if p["sc_need"][0] else 0.0) + (SC_TR if p["sc_need"][1] else 0.0)
+                cost_run[n] = min(cost_run[n], c)
         # Candidates whose only reason is a changed fixture they read: measured on the 120
         # development mutants, 31 of 32 such candidates failed; smoothed (31 + 4*0.5)/(32 + 4).
         ctx_ = p["ctx"]
@@ -327,6 +362,8 @@ def main():
         fixture_only = "data" in kinds and not (kinds - {"data", "comments-only", "docstring"})
 
         def p_eff(n):
+            if n == sc_num and p["shortcut"]:
+                return SC_PRIOR
             if fixture_only:
                 return FIXTURE_PRIOR
             return min(0.98, pfail.get(rt_to_idx.get(n), P_FAIL))
@@ -386,10 +423,20 @@ def main():
             if clash:
                 jobs.append((None, clash))
             # the shortcut patches the executor's optimize; keep it in the job that runs the test
-            jobs = [(rs_, nums_, sc["table"] if p["shortcut"] and sc_num in nums_ else None) for rs_, nums_ in jobs]
+            def sc_arg(nums_):
+                if not (p["shortcut"] and sc_num in nums_):
+                    return None
+                # only test of its class in the job: its tables can load lazily
+                lazy = not any(n != sc_num and cls_of(n) == cls_of(sc_num) for n in nums_)
+                need_o, need_t = p.get("sc_need", (True, True))
+                return ("v2", sc["table"], need_o, need_t, lazy)
+
+            jobs = [(rs_, nums_, sc_arg(nums_)) for rs_, nums_ in jobs]
         p["jobs"] = jobs
         p["run"] = run
         p["cost_run"] = {n: cost_run[n] for n in run}
+        if os.environ.get("BR_DEBUG"):
+            log(f"{cid}: RUN " + " ".join(f"{id_of[n].split('::')[-1]}={cost_run[n] / CPU_SCALE:.2f}" for n in sorted(run, key=lambda n: -cost_run[n])[:8]))
         why = "; ".join(p["ctx"].why) if p["ctx"] is not None else "error"
         log(
             f"{cid}: cand={len(cand)} run={len(run)} restricted={sum(1 for n in run if n in restr)} "
