@@ -48,7 +48,7 @@ DEFAULT_RATIO = 1.15
 # The scoring machines charge more CPU than the machine the CPU table was measured on
 # (practice runs: verifying more saved 6.6 s of simulated time but cost 8.7 s of CPU).
 # Every verification cost the planner weighs is multiplied by this.
-CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.8"))
+CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "0.05"))
 FIXTURE_PRIOR = (31 + 4 * 0.5) / (32 + 4)
 # share of development mutants with candidates where some candidate failed: 77 of 88,
 # smoothed (77 + 1) / (88 + 2)
