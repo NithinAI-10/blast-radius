@@ -85,6 +85,12 @@ each mutant and, per test, smoothed failures / candidacies toward a size prior
 fixed `p0` for the three slowest tests, which the labels skip). The organizers'
 sample answers and our second, held-out mutant batch were not used.
 
+**Fixture-edit candidates.** A test that is a candidate only because a fixture file it
+reads was edited gets one shared prior instead of its per-test one. It was measured the
+same way, on the same 120 development mutants: 31 of the 32 such candidates failed,
+smoothed to (31 + 4·0.5) / (32 + 4). Like every prior, it only decides whether
+verifying such a test is worth the CPU, never whether the test is listed.
+
 **How the planner uses them.** For each commit the selector estimates the cost of
 listing every candidate (`partition`) against verifying some of them:
 verification CPU + the prior × the listed seconds of each verified test (it is

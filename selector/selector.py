@@ -47,6 +47,7 @@ DEFAULT_RATIO = 1.15
 # (practice runs: verifying more saved 6.6 s of simulated time but cost 8.7 s of CPU).
 # Every verification cost the planner weighs is multiplied by this.
 CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "2.0"))
+FIXTURE_PRIOR = (31 + 4 * 0.5) / (32 + 4)
 P_FAIL = float(os.environ.get("BR_PFAIL", "0.2"))  # chance a verified candidate fails and gets listed anyway
 
 PRINTED = set()
@@ -319,7 +320,15 @@ def main():
             if n == sc_num and p["shortcut"]:
                 # parse+optimize of the chosen queries (~11% of the test) plus some re-execution
                 cost_run[n] = 1.4 + 0.11 * cost_run[n] + 1.0
+        # Candidates whose only reason is a changed fixture they read: measured on the 120
+        # development mutants, 31 of 32 such candidates failed; smoothed (31 + 4*0.5)/(32 + 4).
+        ctx_ = p["ctx"]
+        kinds = ctx_.kinds if ctx_ is not None else set()
+        fixture_only = "data" in kinds and not (kinds - {"data", "comments-only", "docstring"})
+
         def p_eff(n):
+            if fixture_only:
+                return FIXTURE_PRIOR
             return min(0.98, pfail.get(rt_to_idx.get(n), P_FAIL))
 
         cost_run = {n: c * CPU_SCALE for n, c in cost_run.items()}
