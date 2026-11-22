@@ -79,10 +79,7 @@ def child_main(root: str, groups: list[tuple[str, str, list[tuple[int, str]]]], 
         try:
             import tpcds_shortcut
 
-            if isinstance(shortcut, tuple) and shortcut[0] == "v2":
-                tpcds_shortcut.install2(*shortcut[1:])
-            else:
-                tpcds_shortcut.install(shortcut)
+            tpcds_shortcut.install(shortcut)
         except BaseException:
             pass  # without the shortcut the test simply runs in full
 
@@ -130,19 +127,13 @@ def child_main(root: str, groups: list[tuple[str, str, list[tuple[int, str]]]], 
                 self.class_error = True
 
         def addError(self, test, err):
-            if os.environ.get("BR_CHILD_LOG"):
-                import traceback; traceback.print_exception(*err)
             self._mark(test)
 
         def addFailure(self, test, err):
-            if os.environ.get("BR_CHILD_LOG"):
-                import traceback; traceback.print_exception(*err, limit=-3)
             self._mark(test)
 
         def addSubTest(self, test, subtest, err):
             if err is not None:
-                if os.environ.get("BR_CHILD_LOG"):
-                    import traceback; print("SUBTEST", subtest, file=sys.stderr); traceback.print_exception(*err, limit=-3)
                 self.bad = True
                 sc = sys.modules.get("tpcds_shortcut")
                 if sc is not None:
@@ -161,8 +152,6 @@ def child_main(root: str, groups: list[tuple[str, str, list[tuple[int, str]]]], 
                 surrogates.apply(mod, cls, meth)
             tests = [(num, cls(meth)) for num, meth in items]
         except BaseException:
-            if os.environ.get("BR_CHILD_LOG"):
-                import traceback; traceback.print_exc()
             for num, _ in items:
                 out.write(f"{num} F\n")
             continue
@@ -170,8 +159,6 @@ def child_main(root: str, groups: list[tuple[str, str, list[tuple[int, str]]]], 
         try:
             unittest.TestSuite([t for _, t in tests]).run(res)
         except BaseException:
-            if os.environ.get("BR_CHILD_LOG"):
-                import traceback; traceback.print_exc()
             res.class_error = True
         finally:
             signal.setitimer(signal.ITIMER_PROF, 0)
