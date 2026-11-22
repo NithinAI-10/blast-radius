@@ -278,6 +278,8 @@ class Ctx:
         self.spans = []  # [(path, range)] runtime lines whose execution the change can alter
         self.coarse = False  # some change is not tied to specific runtime lines
         self.kinds = set()  # kinds of change seen (runtime, weak, class-attr, data, ...)
+        self.def_spans = []  # [(path, range)] attribute/constant definitions (their effect flows only through reads)
+        self.read_spans = []  # [(path, range)] lines that read a changed attribute/constant
 
 
 def analyze_location(M, path, idx: PyIndex, line, c0, c1, ctx: Ctx, insertion=False, flip=False):
@@ -356,9 +358,11 @@ def analyze_location(M, path, idx: PyIndex, line, c0, c1, ctx: Ctx, insertion=Fa
             ref = 0
             for nm in names:
                 ref |= ctx.refs(nm, path, stmt, flip=flip)
+                ctx.read_spans.extend(ctx.refs.read_locs(nm, path, stmt))
             narrowed = cls_bits & ref
             ctx.bits |= narrowed
             ctx.spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
+            ctx.def_spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
             ctx.why.append(f"{path}:{line} class-attr {','.join(names)} n={narrowed.bit_count()} (class n={cls_bits.bit_count()})")
             return
         ctx.bits |= cls_bits
@@ -375,8 +379,10 @@ def analyze_location(M, path, idx: PyIndex, line, c0, c1, ctx: Ctx, insertion=Fa
         ref = 0
         for nm in names:
             ref |= ctx.refs(nm, path, stmt, flip=flip)
+            ctx.read_spans.extend(ctx.refs.read_locs(nm, path, stmt))
         ctx.bits |= ref
         ctx.spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
+        ctx.def_spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
         ctx.why.append(f"{path}:{line} module-const {','.join(names)} n={ref.bit_count()}")
         return
 
@@ -707,6 +713,43 @@ class RefIndex:
                     elif isinstance(inner, ast.Name) and inner.id == name:
                         out[(inner.lineno, inner.col_offset)] = f"{site}!{j}"
         cache[name] = out
+        return out
+
+    def read_locs(self, name, path, stmt):
+        """[(path, range)] of every line that may read `name` (import lines excluded; a
+        default argument stands for its function's body). Over-approximates reads."""
+        key = ("locs", name, path, stmt.lineno)
+        if key in self._cache:
+            return self._cache[key]
+        pat = re.compile(r"\b" + re.escape(name) + r"\b")
+        defpat = re.compile(r"^\s*" + re.escape(name) + r"\s*(:[^=]*)?(=(?!=)|$)")
+        out = []
+        for ent in self._sources():
+            p, src = ent[0], ent[1]
+            if name not in src:
+                continue
+            if ent[2] is None:
+                ent[2] = [m.start() for m in _NL.finditer(src)]
+            nl = ent[2]
+            imports, headers = self._ast_info(ent)
+            for m in pat.finditer(src):
+                ln = bisect.bisect_left(nl, m.start()) + 1
+                if p == path and stmt.lineno <= ln <= stmt.end_lineno:
+                    continue
+                if ln in imports:
+                    continue
+                ls = nl[ln - 2] + 1 if ln > 1 else 0
+                le = nl[ln - 1] if ln - 1 < len(nl) else len(src)
+                text = src[ls:le]
+                if defpat.match(text) and len(pat.findall(text)) == 1:
+                    continue  # another class defining its own value is not a read
+                hdr = next((h for h in headers if h[0] <= ln <= h[1]), None)
+                if hdr is not None:
+                    # a default argument is bound at import time and read by the body
+                    out.append((p, range(hdr[2], hdr[3] + 1)))
+                    continue
+                out.append((p, range(ln, ln + 1)))
+        self._cache[key] = out
         return out
 
     def __call__(self, name, path, stmt, flip=False):

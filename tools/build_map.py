@@ -122,6 +122,21 @@ if os.path.exists(ph_path):
             "table": ph["table"],
         }
 
+ph2_path = os.path.join(os.path.dirname(raw_dir), "tpcds_phase2.json")
+if os.path.exists(ph2_path):
+    ph2 = json.load(open(ph2_path))
+    if ph2.get("ok"):
+        data["tpcds_sc2"] = {
+            "test": "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+            "resid": {k: frozenset(v) for k, v in ph2["resid"].items()},
+            "table": {k: tuple(v) for k, v in ph2["table"].items()},
+        }
+        ph3_path = os.path.join(os.path.dirname(raw_dir), "tpcds_phase3.json")
+        ph3 = json.load(open(ph3_path))
+        assert ph3.get("ok")
+        for k in ("O", "T"):
+            data["tpcds_sc2"][k] = {p: frozenset(v) for p, v in ph3[k].items()}
+
 pf_path = os.path.join(os.path.dirname(raw_dir), "pfail.json")
 if os.path.exists(pf_path):
     data["pfail"] = {int(k): v for k, v in json.load(open(pf_path)).items()}

@@ -51,14 +51,21 @@ costly to verify), packed onto the worker count that minimises each commit's cos
    values diverged can change outcome. Comparisons evaluated at import time are
    excluded from this rule.
 
-6. **TPC-DS shortcut** (`selector/tpcds_shortcut.py`, `tools/trace_phase.py`).
-   `test_execute_tpcds` parses and optimizes each query (~3 s in all), then
-   plans and runs it in pure Python (~27 s). We traced which lines this test runs
-   outside parse/optimize. When a patch touches none of them, a query whose
-   parsed input and optimized output fingerprint (`selector/canon.py`, independent
-   of sqlglot's own equality) match the pinned commit's must execute the same, so
-   only queries with a changed plan are executed. Queries run lazily, one at a
-   time, and the first failure stops the test.
+6. **TPC-DS shortcut** (`selector/tpcds_shortcut.py`, `tools/trace_phase2.py`,
+   `tools/trace_phase3.py`). `test_execute_tpcds` parses each query, optimizes it
+   inside the executor, runs it in pure Python and compares the rows with duckdb
+   running `transpile(sql, write="duckdb")` (~38 s CPU; parse 0.9 s, optimize 3.3 s,
+   transpile 0.5 s). On the pinned commit we traced the lines this test runs in each
+   phase: parse, optimize, transpile, and everything else (imports, class setup,
+   planning, execution, comparison). We also stored, per query, fingerprints of the
+   parsed input and optimized plan (`selector/canon.py`, independent of sqlglot's own
+   equality) and the duckdb SQL. When no changed line, and no line reading a changed
+   class attribute or module constant, runs in the "everything else" phase, a query
+   whose parsed input, plan and duckdb SQL all match the pinned commit's must run and
+   compare the same, so only queries where one of them changed are executed. Optimize
+   and transpile are re-run only when a changed line runs inside them; the CSV tables
+   load only if some query executes. Queries run lazily, one at a time, and the first
+   failure stops the test. Any non-Python or test-file change disables the shortcut.
 
 7. **Verification** (`selector/runner.py`). Candidates whose running costs less
    than listing them are run with `unittest` in a forked child, against an
@@ -91,19 +98,23 @@ same way, on the same 120 development mutants: 31 of the 32 such candidates fail
 smoothed to (31 + 4·0.5) / (32 + 4). Like every prior, it only decides whether
 verifying such a test is worth the CPU, never whether the test is listed.
 
+**TPC-DS under the shortcut.** When the shortcut applies, `test_execute_tpcds` gets the
+prior 0.2 instead of its per-test 0.4: of the 120 development mutants, 3 made it a
+candidate with the shortcut applicable, and none failed it; smoothed like the others,
+(0 + 4·0.35) / (3 + 4). `tools/tpcds_prior.py` lists those cases.
+
 **How the planner uses them.** For each commit the selector estimates the cost of
 listing every candidate (`partition`) against verifying some of them:
-verification CPU + the prior × the listed seconds of each verified test (it is
-listed anyway if it fails) + the schedule of what is left. It takes the cheaper of
-two plans: the best prefix of candidates ordered by CPU per listed second, and a
-greedy plan over the heaviest tests plus the block of small ones, which counts how
-much the actual worker schedule shrinks when each is verified and passes.
+verification CPU + the prior × how much the worker schedule grows if that test fails
+and is listed + the schedule of what is left. It takes the cheaper of two plans: the
+best prefix of candidates ordered by CPU per listed second, and a greedy plan over the
+heaviest tests plus the block of small ones.
 
 Every verification cost the planner weighs (test CPU, class setup, per-child overhead)
-is multiplied by `CPU_SCALE` = 2.0, because the scoring machines charge more CPU than
-the machine the CPU table was measured on: on the practice board, verifying more saved
-6.6 s of simulated time but cost 8.7 s of CPU. On held-out patches, scales from 2.0 to
-2.5 gave the lowest simulated + scaled CPU, with no misses at any scale.
+is multiplied by `CPU_SCALE` = 1.2. The organizers' per-test seconds match the CPU we
+measured for the same tests (ratio 0.92 over the 32 tests above 0.3 s, 103 s vs 101 s
+over the whole suite), and the practice-board CPU of our four submissions fits a fixed
+~2 s plus about 1.1x our local CPU. An earlier factor of 2.0 overcharged verification.
 
 ## Dependencies
 
