@@ -54,7 +54,7 @@ def build_overlay(base: str, root: str, files: dict[str, str | None]) -> None:
             f.write(text)
 
 
-def child_main(root: str, groups: list[tuple[str, str, list[tuple[int, str]]]], wfd: int, per_test_timeout, restrict=None, shortcut=None) -> None:
+def child_main(root: str, groups: list[tuple[str, str, list[tuple[int, str]]]], wfd: int, per_test_timeout, restrict=None, shortcut=None, calls=None) -> None:
     """groups: [(module_name, class_name, [(number, method), ...]), ...]"""
     import unittest
 
@@ -104,6 +104,10 @@ def child_main(root: str, groups: list[tuple[str, str, list[tuple[int, str]]]], 
 
         def startTest(self, test):
             super().startTest(test)
+            if CALLSTATE is not None:
+                keep = (calls or {}).get(self.nums.get(id(test)))
+                CALLSTATE.keep = set(keep) if keep is not None else None
+                CALLSTATE.count = 0
             self.cur = test
             self.bad = False
             signal.setitimer(signal.ITIMER_PROF, per_test_timeout(self.nums[id(test)]))
@@ -142,12 +146,19 @@ def child_main(root: str, groups: list[tuple[str, str, list[tuple[int, str]]]], 
         def addUnexpectedSuccess(self, test):
             self.bad = True
 
+    CALLSTATE = None
     for modname, clsname, items in groups:
         try:
             mod = __import__(modname, fromlist=["_"])
             if fp is not None:
                 fp.patch_module(mod)
             cls = getattr(mod, clsname)
+            if calls and any(num in calls for num, _ in items):
+                import callskip
+
+                if CALLSTATE is None:
+                    CALLSTATE = callskip.State(None)
+                callskip.install(cls, CALLSTATE)
             for _num, meth in items:
                 surrogates.apply(mod, cls, meth)
             tests = [(num, cls(meth)) for num, meth in items]
@@ -174,7 +185,7 @@ def child_main(root: str, groups: list[tuple[str, str, list[tuple[int, str]]]], 
     os._exit(0)
 
 
-def start(base: str, root: str, files, groups, per_test_timeout, restrict=None, shortcut=None):
+def start(base: str, root: str, files, groups, per_test_timeout, restrict=None, shortcut=None, calls=None):
     k = 0
     while os.path.lexists(root if k == 0 else f"{root}.{k}"):
         k += 1
@@ -185,7 +196,7 @@ def start(base: str, root: str, files, groups, per_test_timeout, restrict=None, 
         os.close(r)
         try:
             build_overlay(base, root, files)
-            child_main(root, groups, w, per_test_timeout, restrict, shortcut)
+            child_main(root, groups, w, per_test_timeout, restrict, shortcut, calls)
         except BaseException:
             pass
         os._exit(0)

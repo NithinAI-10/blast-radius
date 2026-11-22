@@ -147,6 +147,26 @@ number), the candidates are the tests that read that class's value.
 (`tools/gen_attr_mutants.py`, seed 41, labeled by running every candidate of the
 previous analysis; 38 broke at least one test): no missed failing test.
 
+## Running only the checks a change reaches
+
+Most dialect tests are long runs of independent checks (`validate_identity`,
+`validate_all`, `validate_transpile` from `tests/dialects/test_dialect.py`).
+`tools/trace_calls.py` runs every check of every such test in its own forked child,
+starting from a state where sqlglot and the tests are imported but no check has run,
+with all other checks skipped, and records the sqlglot functions it starts and the
+class-level constants it reads. Since each check is traced from scratch, whatever it
+needs that caches would otherwise carry over from earlier checks is included. Code the
+test runs outside its checks is recorded separately, and a test whose outcome changes
+when checks are skipped is never restricted (25 of 1020).
+
+When a change is plain runtime code (or a class-level constant, above), each changed
+line maps to the innermost function holding it, and a candidate Validator test is
+verified running only the checks that start one of those functions (or read that
+constant); the rest are skipped (`selector/callskip.py`). A skipped
+`validate_identity` returns a stand-in that runs the real check if the test touches
+its result. If a changed function also runs outside the checks, was never seen from
+this test's checks, or the change is anything else, the test runs whole.
+
 ## Failure priors and the planner
 
 **What the priors are.** `map.bin` holds one number per test: how likely that test is
@@ -178,7 +198,7 @@ greedy plan over the heaviest tests plus the block of small ones, which counts h
 much the actual worker schedule shrinks when each is verified and passes.
 
 Every verification cost the planner weighs (test CPU, class setup, per-child overhead)
-is multiplied by `CPU_SCALE`, set from practice-board runs of this same selector at
+is multiplied by `CPU_SCALE` (1.5), set from practice-board runs of this same selector at
 different values (a diagnostic run that verified nearly everything showed how much
 listed time verification can remove).
 

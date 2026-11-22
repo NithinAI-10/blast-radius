@@ -12,6 +12,7 @@ For each patch:
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import pickle
@@ -36,6 +37,7 @@ TMP = os.environ.get("BR_TMP", "/tmp")
 WALL_LIMIT = float(os.environ.get("BR_WALL", "150"))  # seconds; the scorer allows 180 (270 in the final)
 PAR = int(os.environ.get("BR_PAR", "2"))
 NO_RUN = os.environ.get("BR_NORUN") == "1"
+NO_CALLS = os.environ.get("BR_NOCALLS") == "1"
 NO_ITEMS = os.environ.get("BR_NOITEMS") == "1"
 
 WORKER_MS = 2000
@@ -46,7 +48,7 @@ DEFAULT_RATIO = 1.15
 # The scoring machines charge more CPU than the machine the CPU table was measured on
 # (practice runs: verifying more saved 6.6 s of simulated time but cost 8.7 s of CPU).
 # Every verification cost the planner weighs is multiplied by this.
-CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "0.5"))
+CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.5"))
 FIXTURE_PRIOR = (31 + 4 * 0.5) / (32 + 4)
 # share of development mutants with candidates where some candidate failed: 77 of 88,
 # smoothed (77 + 1) / (88 + 2)
@@ -289,6 +291,77 @@ def main():
         chosen = sum(len(v) for v in rs.values())
         return full * (0.2 + 0.8 * chosen / total)
 
+    calls_tab = M.get("calls", {})
+    _fn_cache = {}
+
+    def _functions(path):
+        """[(start, end, body_start, key)] for every function/lambda/genexpr in the pinned file."""
+        if path not in _fn_cache:
+            out = []
+            src = read_orig(path)
+            try:
+                tree = ast.parse(src) if src is not None else None
+            except SyntaxError:
+                tree = None
+            for node in ast.walk(tree) if tree is not None else ():
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    first = min([d.lineno for d in node.decorator_list] + [node.lineno])
+                    out.append((node.lineno, node.end_lineno, node.body[0].lineno, f"{path}:{first}"))
+                elif isinstance(node, (ast.Lambda, ast.GeneratorExp)):
+                    out.append((node.lineno, node.end_lineno, node.lineno, f"{path}:{node.lineno}"))
+            _fn_cache[path] = out
+        return _fn_cache[path]
+
+    RUNTIME_KINDS = {"runtime", "weak-mutation", "comments-only", "docstring", "comments-only;", "docstring;"}
+
+    def code_keys(p):
+        """sqlglot functions holding every changed line of a plain runtime change, or None."""
+        ctx = p["ctx"]
+        if ctx is None or ctx.coarse or p["files"] is None:
+            return None
+        if any(not (f.startswith("sqlglot/") and f.endswith(".py")) for f in p["files"]):
+            return None
+        keys = {"attr:" + k for k in getattr(ctx, "attr_keys", ())}
+        const_spans = set()
+        for w in ctx.why:
+            parts = w.split(" ")
+            if len(parts) >= 2 and parts[1] == "class-const":
+                pth, _, ln = parts[0].rpartition(":")
+                const_spans.add((pth, int(ln)))
+                continue
+            if len(parts) < 2 or parts[1] not in RUNTIME_KINDS:
+                return None
+        for path, span in ctx.spans:
+            if any((path, ln) in const_spans for ln in span):
+                continue  # a class constant: its readers are the "attr:" key
+            fns = _functions(path)
+            for ln in span:
+                inner = None
+                for st, en, body, key in fns:
+                    if st <= ln <= en and (inner is None or st >= inner[0]):
+                        inner = (st, en, body, key)
+                if inner is None or ln < inner[2]:
+                    return None  # module/class level or a function header: evaluated at import
+                keys.add(inner[3])
+        return keys
+
+    def call_mask(n, keys):
+        """Check indices of test n that start one of these functions, or None to run it all."""
+        info = calls_tab.get(rt_to_idx.get(n))
+        if info is None or keys is None:
+            return None
+        if keys & info["outside"]:
+            return None
+        m = 0
+        for k in keys:
+            v = info["masks"].get(k)
+            if v is None:
+                return None  # never seen from this test's checks: run it whole
+            m |= v
+        if m == (1 << info["n"]) - 1:
+            return None
+        return m
+
     sc = M.get("tpcds_sc")
     sc_num = rt_by_id[sc["test"]]["number"] if sc and sc["test"] in rt_by_id else None
 
@@ -313,6 +386,10 @@ def main():
         restr = {}
         cost_run = {}
         p["shortcut"] = sc_num in cand and shortcut_ok(p)
+        ck = code_keys(p) if not NO_CALLS else None
+        if os.environ.get("BR_DEBUG") and ck is not None:
+            log(f"{cid}: code keys {sorted(ck)[:4]}")
+        p["calls_keep"] = {}
         for n in cand:
             rs = restriction(n, p) if p["files"] is not None else None
             if rs is not None:
@@ -320,6 +397,11 @@ def main():
                 cost_run[n] = restricted_cpu(n, rs)
             else:
                 cost_run[n] = cpu_of(n)
+                cm = call_mask(n, ck) if ck else None
+                if cm is not None:
+                    info = calls_tab[rt_to_idx[n]]
+                    p["calls_keep"][n] = [i for i in range(info["n"]) if cm >> i & 1]
+                    cost_run[n] = cost_run[n] * (0.15 + 0.85 * cm.bit_count() / info["n"])
             if n == sc_num and p["shortcut"]:
                 # parse+optimize of the chosen queries (~11% of the test) plus some re-execution
                 cost_run[n] = 1.4 + 0.11 * cost_run[n] + 1.0
@@ -438,7 +520,8 @@ def main():
             groups.setdefault((path[:-3].replace("/", "."), cls), []).append((n, meth))
         g = [(m, c, items) for (m, c), items in groups.items()]
         root = os.path.join(TMP, "br", cid)
-        pid, fd, root = runner.start(BASE, root, p["files"], g, per_test_timeout, rs, sct)
+        ckeep = {n: p["calls_keep"][n] for n in nums if n in p.get("calls_keep", {})}
+        pid, fd, root = runner.start(BASE, root, p["files"], g, per_test_timeout, rs, sct, ckeep or None)
         deadline = time.monotonic() + 8.0 + sum(per_test_timeout(n) for n in nums)
         running[fd] = [cid, pid, b"", deadline, root]
 

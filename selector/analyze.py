@@ -280,6 +280,7 @@ class Ctx:
         self.coarse = False  # some change is not tied to specific runtime lines
         self.kinds = set()  # kinds of change seen (runtime, weak, class-attr, data, ...)
         self.dict_changes = {}  # path -> {statement line: (name, {key labels})}
+        self.attr_keys = []  # "module:Qualname.NAME" of narrowed class-constant changes
         self.attr_changes = {}  # path -> {statement line: "module:Qualname.NAME"}
         self.argtypes_changes = {}  # path -> {statement line: (class, {arg: (old, new required)})}
 
@@ -361,6 +362,7 @@ def analyze_location(M, path, idx: PyIndex, line, c0, c1, ctx: Ctx, insertion=Fa
         b = am["read"].get(ak, 0) | am["failed"]
         ctx.bits |= b
         ctx.spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
+        ctx.attr_keys.append(ak)
         ctx.why.append(f"{path}:{line} class-const {ak.split(':', 1)[1]} n={b.bit_count()}")
         return
     at = ctx.argtypes_changes.get(path, {}).get(stmt.lineno) if stmt is not None else None
