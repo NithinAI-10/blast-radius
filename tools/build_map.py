@@ -137,6 +137,14 @@ if os.path.exists(ph2_path):
         for k in ("O", "T"):
             data["tpcds_sc2"][k] = {p: frozenset(v) for p, v in ph3[k].items()}
 
+dk_dir = os.path.join(os.path.dirname(raw_dir), "dictkeys")
+if os.path.isdir(dk_dir):
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import build_dictkeys
+
+    repo_dir = os.environ.get("BR_REPO", "/home/claude/sqlglot")  # the pinned checkout
+    data["dk"] = build_dictkeys.build(repo_dir, dk_dir, {t["number"]: t["number"] for t in tests})
+
 pf_path = os.path.join(os.path.dirname(raw_dir), "pfail.json")
 if os.path.exists(pf_path):
     data["pfail"] = {int(k): v for k, v in json.load(open(pf_path)).items()}

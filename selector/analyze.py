@@ -12,6 +12,7 @@ CPU when we verify it, a missed failure costs 300 s.
 from __future__ import annotations
 
 import ast
+import copy
 import bisect
 import io
 import re
@@ -278,8 +279,7 @@ class Ctx:
         self.spans = []  # [(path, range)] runtime lines whose execution the change can alter
         self.coarse = False  # some change is not tied to specific runtime lines
         self.kinds = set()  # kinds of change seen (runtime, weak, class-attr, data, ...)
-        self.def_spans = []  # [(path, range)] attribute/constant definitions (their effect flows only through reads)
-        self.read_spans = []  # [(path, range)] lines that read a changed attribute/constant
+        self.dict_changes = {}  # path -> {statement line: (name, {key labels})}
 
 
 def analyze_location(M, path, idx: PyIndex, line, c0, c1, ctx: Ctx, insertion=False, flip=False):
@@ -352,17 +352,28 @@ def analyze_location(M, path, idx: PyIndex, line, c0, c1, ctx: Ctx, insertion=Fa
         return
 
     cls_bits = _class_bits(M, path, idx, anc)
+    de = ctx.dict_changes.get(path, {}).get(stmt.lineno) if stmt is not None else None
+    dk = M.get("dk")
+    if cls_bits is not None and de is not None and dk is not None:
+        name, labels = de
+        if name not in dk["unsafe"] and not (labels & dk["unsafe_keys"].get(name, set())):
+            # only constants in these entries' values changed: tests that read them
+            b = dk["whole"].get(name, 0) | dk["failed"]
+            for lb in labels:
+                b |= dk["keys"].get(name, {}).get(lb, 0)
+            ctx.bits |= b
+            ctx.spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
+            ctx.why.append(f"{path}:{line} dict-entry {name}[{','.join(sorted(labels))[:60]}] n={b.bit_count()}")
+            return
     if cls_bits is not None:
         names = _assigned_names(idx, stmt, anc)
         if names and ctx.refs is not None:
             ref = 0
             for nm in names:
                 ref |= ctx.refs(nm, path, stmt, flip=flip)
-                ctx.read_spans.extend(ctx.refs.read_locs(nm, path, stmt))
             narrowed = cls_bits & ref
             ctx.bits |= narrowed
             ctx.spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
-            ctx.def_spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
             ctx.why.append(f"{path}:{line} class-attr {','.join(names)} n={narrowed.bit_count()} (class n={cls_bits.bit_count()})")
             return
         ctx.bits |= cls_bits
@@ -379,10 +390,8 @@ def analyze_location(M, path, idx: PyIndex, line, c0, c1, ctx: Ctx, insertion=Fa
         ref = 0
         for nm in names:
             ref |= ctx.refs(nm, path, stmt, flip=flip)
-            ctx.read_spans.extend(ctx.refs.read_locs(nm, path, stmt))
         ctx.bits |= ref
         ctx.spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
-        ctx.def_spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
         ctx.why.append(f"{path}:{line} module-const {','.join(names)} n={ref.bit_count()}")
         return
 
@@ -557,6 +566,80 @@ def col_span(old: str, new: str):
     return i, max(i, len(old) - j)
 
 
+def _key_label(k):
+    if isinstance(k, ast.Constant) and isinstance(k.value, (str, int, float, bool)):
+        return str(k.value)
+    if isinstance(k, ast.Attribute):
+        return k.attr
+    return None
+
+
+def _const_free(node):
+    """ast.dump with every constant's value blanked: equal for two trees that differ
+    only in constants."""
+    node = copy.deepcopy(node)
+    for n in ast.walk(node):
+        if isinstance(n, ast.Constant):
+            n.value = None
+    return ast.dump(node, include_attributes=False)
+
+
+def _class_dicts(tree):
+    """{(class path, name): Assign/AnnAssign node} for dict literals bound to one name
+    in class bodies."""
+    out = {}
+    stack = [((), n) for n in tree.body if isinstance(n, ast.ClassDef)]
+    while stack:
+        path, cls = stack.pop()
+        here = path + (cls.name,)
+        for st in cls.body:
+            if isinstance(st, ast.ClassDef):
+                stack.append((here, st))
+            elif isinstance(st, (ast.Assign, ast.AnnAssign)) and isinstance(st.value, ast.Dict):
+                targets = st.targets if isinstance(st, ast.Assign) else [st.target]
+                if len(targets) == 1 and isinstance(targets[0], ast.Name):
+                    out[(here, targets[0].id)] = st
+    return out
+
+
+def dict_entry_changes(old_tree, new_tree):
+    """{old statement line: (name, {key labels})} for class-level dict literals whose
+    keys are unchanged and where only constants inside some entries' values changed."""
+    out = {}
+    try:
+        new = _class_dicts(new_tree)
+        for key, ost in _class_dicts(old_tree).items():
+            nst = new.get(key)
+            if nst is None:
+                continue
+            od, nd = ost.value, nst.value
+            if ast.dump(od, include_attributes=False) == ast.dump(nd, include_attributes=False):
+                continue
+            if len(od.keys) != len(nd.keys):
+                continue
+            labels = set()
+            ok = True
+            for ok_, nk, ov, nv in zip(od.keys, nd.keys, od.values, nd.values):
+                if (ok_ is None) != (nk is None):
+                    ok = False
+                    break
+                if ok_ is not None and ast.dump(ok_, include_attributes=False) != ast.dump(nk, include_attributes=False):
+                    ok = False
+                    break
+                if ast.dump(ov, include_attributes=False) == ast.dump(nv, include_attributes=False):
+                    continue
+                lb = _key_label(ok_) if ok_ is not None else None
+                if lb is None or _const_free(ov) != _const_free(nv):
+                    ok = False
+                    break
+                labels.add(lb)
+            if ok and labels:
+                out[ost.lineno] = (key[1], labels)
+    except Exception:  # noqa: BLE001
+        return {}
+    return out
+
+
 def analyze_py(M, path, old_src, new_src, removed, gaps, pairs, ctx: Ctx):
     if tokens_equal(old_src, new_src) and not (_coding_line(new_src) != _coding_line(old_src)):
         ctx.why.append(f"{path} comments-only")
@@ -578,6 +661,11 @@ def analyze_py(M, path, old_src, new_src, removed, gaps, pairs, ctx: Ctx):
         ctx.why.append(f"{path} syntax-error n={b.bit_count()}")
         return
 
+    if M.get("dk") is not None:
+        try:
+            ctx.dict_changes[path] = dict_entry_changes(idx.tree, ast.parse(new_src))
+        except SyntaxError:
+            pass
     paired = {p[0] for p in pairs}
     old_lines = old_src.split("\n")
     probes = M.get("probe")
@@ -713,43 +801,6 @@ class RefIndex:
                     elif isinstance(inner, ast.Name) and inner.id == name:
                         out[(inner.lineno, inner.col_offset)] = f"{site}!{j}"
         cache[name] = out
-        return out
-
-    def read_locs(self, name, path, stmt):
-        """[(path, range)] of every line that may read `name` (import lines excluded; a
-        default argument stands for its function's body). Over-approximates reads."""
-        key = ("locs", name, path, stmt.lineno)
-        if key in self._cache:
-            return self._cache[key]
-        pat = re.compile(r"\b" + re.escape(name) + r"\b")
-        defpat = re.compile(r"^\s*" + re.escape(name) + r"\s*(:[^=]*)?(=(?!=)|$)")
-        out = []
-        for ent in self._sources():
-            p, src = ent[0], ent[1]
-            if name not in src:
-                continue
-            if ent[2] is None:
-                ent[2] = [m.start() for m in _NL.finditer(src)]
-            nl = ent[2]
-            imports, headers = self._ast_info(ent)
-            for m in pat.finditer(src):
-                ln = bisect.bisect_left(nl, m.start()) + 1
-                if p == path and stmt.lineno <= ln <= stmt.end_lineno:
-                    continue
-                if ln in imports:
-                    continue
-                ls = nl[ln - 2] + 1 if ln > 1 else 0
-                le = nl[ln - 1] if ln - 1 < len(nl) else len(src)
-                text = src[ls:le]
-                if defpat.match(text) and len(pat.findall(text)) == 1:
-                    continue  # another class defining its own value is not a read
-                hdr = next((h for h in headers if h[0] <= ln <= h[1]), None)
-                if hdr is not None:
-                    # a default argument is bound at import time and read by the body
-                    out.append((p, range(hdr[2], hdr[3] + 1)))
-                    continue
-                out.append((p, range(ln, ln + 1)))
-        self._cache[key] = out
         return out
 
     def __call__(self, name, path, stmt, flip=False):
