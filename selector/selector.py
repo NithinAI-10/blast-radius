@@ -43,6 +43,10 @@ CHILD_OVERHEAD = 0.12  # s CPU: fork, overlay, sqlglot import
 HEAVY_MODS = ("numpy", "pandas", "duckdb", "pandas.testing")
 HEAVY_FILES = ("tests/test_executor.py", "tests/test_optimizer.py", "tests/test_serde.py")
 DEFAULT_RATIO = 1.15
+# The scoring machines charge more CPU than the machine the CPU table was measured on
+# (practice runs: verifying more saved 6.6 s of simulated time but cost 8.7 s of CPU).
+# Every verification cost the planner weighs is multiplied by this.
+CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "2.0"))
 P_FAIL = float(os.environ.get("BR_PFAIL", "0.2"))  # chance a verified candidate fails and gets listed anyway
 
 PRINTED = set()
@@ -114,7 +118,7 @@ def marginal_plan(cand, cost_run, p_eff, dur_ms, cls_of, cls_setup, heavy_n=12):
         chosen = []
         def est(ch):
             classes = {cls_of(n) for n in ch} | (small_cls if vs else set())
-            e = CHILD_OVERHEAD if (ch or vs) else 0.0
+            e = CHILD_OVERHEAD * CPU_SCALE if (ch or vs) else 0.0
             e += sum(cost_run[n] + p_eff(n) * dur_ms[n] / 1000 for n in ch)
             e += sum(cls_setup.get(c, 0.0) for c in classes)
             if vs:
@@ -318,12 +322,15 @@ def main():
         def p_eff(n):
             return min(0.98, pfail.get(rt_to_idx.get(n), P_FAIL))
 
+        cost_run = {n: c * CPU_SCALE for n, c in cost_run.items()}
+        setup_s = {c: v * CPU_SCALE for c, v in cls_setup.items()}
+
         # run tests in order of run-cost per listed second, keep the best prefix
         order = sorted(cand, key=lambda n: (cost_run[n] / max(dur_ms[n] / 1000, 0.001), cost_run[n]))
         out_only = partition([(n, dur_ms[n]) for n in cand])[0] / 1000
         best = (out_only, 0)
         if p["files"] is not None and not NO_RUN:
-            acc = CHILD_OVERHEAD
+            acc = CHILD_OVERHEAD * CPU_SCALE
             classes = set()
             all_pass = 1.0
             for k, n in enumerate(order):
@@ -333,7 +340,7 @@ def main():
                 c = cls_of(n)
                 if c not in classes:
                     classes.add(c)
-                    acc += cls_setup.get(c, 0.0)
+                    acc += setup_s.get(c, 0.0)
                 rest = order[k + 1:]
                 est = acc + partition([(m, dur_ms[m]) for m in rest])[0] / 1000
                 if not rest:
@@ -342,7 +349,7 @@ def main():
                     best = (est, k + 1)
         run = order[: best[1]]
         if p["files"] is not None and not NO_RUN and len(cand) > 1:
-            alt = marginal_plan(cand, cost_run, p_eff, dur_ms, cls_of, cls_setup)
+            alt = marginal_plan(cand, cost_run, p_eff, dur_ms, cls_of, setup_s)
             if alt is not None and alt[0] < best[0] - 0.05:
                 best = (alt[0], -1)
                 run = alt[1]

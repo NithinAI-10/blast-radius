@@ -93,6 +93,12 @@ two plans: the best prefix of candidates ordered by CPU per listed second, and a
 greedy plan over the heaviest tests plus the block of small ones, which counts how
 much the actual worker schedule shrinks when each is verified and passes.
 
+Every verification cost the planner weighs (test CPU, class setup, per-child overhead)
+is multiplied by `CPU_SCALE` = 2.0, because the scoring machines charge more CPU than
+the machine the CPU table was measured on: on the practice board, verifying more saved
+6.6 s of simulated time but cost 8.7 s of CPU. On held-out patches, scales from 2.0 to
+2.5 gave the lowest simulated + scaled CPU, with no misses at any scale.
+
 ## Dependencies
 
 - sqlglot at commit `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`, downloaded from
