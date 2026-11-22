@@ -46,8 +46,11 @@ DEFAULT_RATIO = 1.15
 # The scoring machines charge more CPU than the machine the CPU table was measured on
 # (practice runs: verifying more saved 6.6 s of simulated time but cost 8.7 s of CPU).
 # Every verification cost the planner weighs is multiplied by this.
-CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "0.05"))
+CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "1.0"))
 FIXTURE_PRIOR = (31 + 4 * 0.5) / (32 + 4)
+# share of development mutants with candidates where some candidate failed: 77 of 88,
+# smoothed (77 + 1) / (88 + 2)
+BREAK_RATE = (77 + 1) / (88 + 2)
 P_FAIL = float(os.environ.get("BR_PFAIL", "0.2"))  # chance a verified candidate fails and gets listed anyway
 
 PRINTED = set()
@@ -363,6 +366,8 @@ def main():
                 best = (alt[0], -1)
                 run = alt[1]
         runset = set(run)
+        p["p_eff"] = p_eff
+        p["setup_s"] = setup_s
         p["out"] = [n for n in order if n not in runset]
         p["est"] = best[0]
         # jobs: one child for unrestricted tests plus restricted ones; a second
@@ -424,7 +429,8 @@ def main():
 
         def per_test_timeout(n):
             # generous for small tests, ~3x expected CPU for big ones; a timeout lists the test
-            return 4.0 + 3.0 * exp.get(n, cpu_of(n))
+            # exp holds CPU_SCALE-weighted planning costs; time out on real CPU
+            return 4.0 + 3.0 * (exp[n] / CPU_SCALE if n in exp else cpu_of(n))
 
         groups = {}
         for n in nums:
@@ -465,32 +471,72 @@ def main():
 
     if queue:
         os.makedirs(os.path.join(TMP, "br"), exist_ok=True)
-    while queue or running:
-        now = time.monotonic()
-        while queue and len(running) < PAR and now - T0 < WALL_LIMIT - 10:
-            _, cid, rs, nums, sct = queue.pop(0)
-            launch(cid, rs, nums, sct)
-        if not running:
-            break
-        fds = list(running)
-        timeout = max(0.0, min(min(running[f][3] for f in fds), T0 + WALL_LIMIT) - time.monotonic())
-        ready, _, _ = select.select(fds, [], [], min(timeout, 1.0))
-        for fd in ready:
-            try:
-                chunk = os.read(fd, 65536)
-            except BlockingIOError:
+    def drain():
+        while queue or running:
+            now = time.monotonic()
+            while queue and len(running) < PAR and now - T0 < WALL_LIMIT - 10:
+                _, cid, rs, nums, sct = queue.pop(0)
+                launch(cid, rs, nums, sct)
+            if not running:
+                break
+            fds = list(running)
+            timeout = max(0.0, min(min(running[f][3] for f in fds), T0 + WALL_LIMIT) - time.monotonic())
+            ready, _, _ = select.select(fds, [], [], min(timeout, 1.0))
+            for fd in ready:
+                try:
+                    chunk = os.read(fd, 65536)
+                except BlockingIOError:
+                    continue
+                if chunk:
+                    running[fd][2] += chunk
+                else:
+                    finish(fd)
+            now = time.monotonic()
+            for fd in list(running):
+                if now > running[fd][3] or now - T0 > WALL_LIMIT:
+                    log(f"{running[fd][0]}: verification killed at deadline")
+                    finish(fd, kill=True)
+            if time.monotonic() - T0 > WALL_LIMIT:
+                queue.clear()
+
+    drain()
+
+    # ---- mop-up: a commit whose verified tests all passed has likely broken nothing,
+    # so the few cheap tests left listed (each listing costs at least a 2 s worker) are
+    # now worth verifying too. Commit-level break rate from the development mutants.
+    if not NO_RUN and time.monotonic() - T0 < WALL_LIMIT - 20:
+        for cid in commits:
+            p = plans[cid]
+            out = [n for n in p.get("out", []) if n != sc_num]
+            if not p.get("run") or not out or len(out) != len(p["out"]) or p["files"] is None:
                 continue
-            if chunk:
-                running[fd][2] += chunk
-            else:
-                finish(fd)
-        now = time.monotonic()
-        for fd in list(running):
-            if now > running[fd][3] or now - T0 > WALL_LIMIT:
-                log(f"{running[fd][0]}: verification killed at deadline")
-                finish(fd, kill=True)
-        if time.monotonic() - T0 > WALL_LIMIT:
-            queue.clear()
+            res = results[cid]
+            if any(res.get(n) != "P" for n in p["run"]):
+                continue
+            pe = p["p_eff"]
+            q = lambda n: min(0.98, pe(n) / BREAK_RATE)
+            a = 1.0
+            for n in p["run"]:
+                a *= 1.0 - q(n)
+            post = BREAK_RATE * a / ((1.0 - BREAK_RATE) + BREAK_RATE * a)
+            b = 1.0
+            for n in out:
+                b *= 1.0 - q(n)
+            p_pass = (1.0 - post) + post * b
+            listed = partition([(n, dur_ms[n]) for n in out])[0] / 1000
+            have = {cls_of(n) for n in p["run"]}
+            cost = CHILD_OVERHEAD * CPU_SCALE + sum(cpu_of(n) * CPU_SCALE for n in out)
+            cost += sum(p["setup_s"].get(c, 0.0) for c in {cls_of(n) for n in out} - have)
+            if os.environ.get("BR_DEBUG"):
+                log(f"{cid}: mop? out={len(out)} p_pass={p_pass:.2f} post={post:.2f} listed={listed:.2f} cost={cost:.2f}")
+            if cost < p_pass * listed - 0.05:
+                p["run"] = list(p["run"]) + out
+                p["out"] = []
+                p["cost_run"] = {**p["cost_run"], **{n: cpu_of(n) * CPU_SCALE for n in out}}
+                queue.append((sum(cpu_of(n) for n in out), cid, None, out, None))
+                log(f"{cid}: mop-up {len(out)} tests (p_pass={p_pass:.2f}, listed={listed:.2f}s, cost={cost:.2f})")
+        queue.sort(key=lambda x: x[0])
+        drain()
 
     # ---- answer
     total_est = 0

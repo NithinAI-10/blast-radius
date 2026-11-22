@@ -178,10 +178,18 @@ greedy plan over the heaviest tests plus the block of small ones, which counts h
 much the actual worker schedule shrinks when each is verified and passes.
 
 Every verification cost the planner weighs (test CPU, class setup, per-child overhead)
-is multiplied by `CPU_SCALE` = 2.0, because the scoring machines charge more CPU than
-the machine the CPU table was measured on: on the practice board, verifying more saved
-6.6 s of simulated time but cost 8.7 s of CPU. On held-out patches, scales from 2.0 to
-2.5 gave the lowest simulated + scaled CPU, with no misses at any scale.
+is multiplied by `CPU_SCALE`, set from practice-board runs of this same selector at
+different values (a diagnostic run that verified nearly everything showed how much
+listed time verification can remove).
+
+**Mop-up.** After verification, a commit whose verified tests all passed has probably
+broken nothing, so the cheap tests still listed (each listing costs at least a 2 s
+worker) are reconsidered. Commits break something or nothing as a whole, so we update
+a commit-level break rate on the evidence: of the 120 development mutants, 88 had
+candidates and 77 of those failed one, smoothed to (77 + 1) / (88 + 2). With every
+verified test passed, the chance the rest pass rises, and they are verified if that
+costs less than the listing it is expected to save. Per-test timeouts use real CPU
+estimates, not the planning weight.
 
 ## Dependencies
 
