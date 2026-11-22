@@ -279,7 +279,11 @@ class Ctx:
         self.spans = []  # [(path, range)] runtime lines whose execution the change can alter
         self.coarse = False  # some change is not tied to specific runtime lines
         self.kinds = set()  # kinds of change seen (runtime, weak, class-attr, data, ...)
+        self.def_spans = []  # [(path, range)] attribute/constant definitions (their effect flows only through reads)
+        self.read_spans = []  # [(path, range)] lines that read a changed attribute/constant
         self.dict_changes = {}  # path -> {statement line: (name, {key labels})}
+        self.dict_owner_changes = []  # (class name, dict name, {key labels}) of narrowed table entries
+        self.req_keys = set()  # "Class.arg" whose required flag flipped
         self.attr_keys = []  # "module:Qualname.NAME" of narrowed class-constant changes
         self.attr_changes = {}  # path -> {statement line: "module:Qualname.NAME"}
         self.argtypes_changes = {}  # path -> {statement line: (class, {arg: (old, new required)})}
@@ -362,7 +366,8 @@ def analyze_location(M, path, idx: PyIndex, line, c0, c1, ctx: Ctx, insertion=Fa
         b = am["read"].get(ak, 0) | am["failed"]
         ctx.bits |= b
         ctx.spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
-        ctx.attr_keys.append(ak)
+        ctx.def_spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
+        ctx.attr_keys.append(ak)  # the TPC-DS shortcut checks this class's own value by phase
         ctx.why.append(f"{path}:{line} class-const {ak.split(':', 1)[1]} n={b.bit_count()}")
         return
     at = ctx.argtypes_changes.get(path, {}).get(stmt.lineno) if stmt is not None else None
@@ -379,12 +384,14 @@ def analyze_location(M, path, idx: PyIndex, line, c0, c1, ctx: Ctx, insertion=Fa
                 b |= atm["missing"].get(f"{c}.{k}", 0)
         ctx.bits |= b
         ctx.spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
+        ctx.def_spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
+        ctx.req_keys.update(f"{c}.{k}" for c in classes for k in args)  # checked per phase for TPC-DS
         ctx.why.append(f"{path}:{line} arg-types {cname}[{','.join(args)}] n={b.bit_count()}")
         return
     de = ctx.dict_changes.get(path, {}).get(stmt.lineno) if stmt is not None else None
     dk = M.get("dk")
     if cls_bits is not None and de is not None and dk is not None:
-        name, labels = de
+        name, labels = de[0], de[1]
         if name not in dk["unsafe"] and not (labels & dk["unsafe_keys"].get(name, set())):
             # only constants in these entries' values changed: tests that read them
             b = dk["whole"].get(name, 0) | dk["failed"]
@@ -392,6 +399,8 @@ def analyze_location(M, path, idx: PyIndex, line, c0, c1, ctx: Ctx, insertion=Fa
                 b |= dk["keys"].get(name, {}).get(lb, 0)
             ctx.bits |= b
             ctx.spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
+            ctx.def_spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
+            ctx.dict_owner_changes.append((de[2], name, set(labels)))  # checked per class for TPC-DS
             ctx.why.append(f"{path}:{line} dict-entry {name}[{','.join(sorted(labels))[:60]}] n={b.bit_count()}")
             return
     if cls_bits is not None:
@@ -400,9 +409,11 @@ def analyze_location(M, path, idx: PyIndex, line, c0, c1, ctx: Ctx, insertion=Fa
             ref = 0
             for nm in names:
                 ref |= ctx.refs(nm, path, stmt, flip=flip)
+                ctx.read_spans.extend(ctx.refs.read_locs(nm, path, stmt))
             narrowed = cls_bits & ref
             ctx.bits |= narrowed
             ctx.spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
+            ctx.def_spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
             ctx.why.append(f"{path}:{line} class-attr {','.join(names)} n={narrowed.bit_count()} (class n={cls_bits.bit_count()})")
             return
         ctx.bits |= cls_bits
@@ -419,8 +430,10 @@ def analyze_location(M, path, idx: PyIndex, line, c0, c1, ctx: Ctx, insertion=Fa
         ref = 0
         for nm in names:
             ref |= ctx.refs(nm, path, stmt, flip=flip)
+            ctx.read_spans.extend(ctx.refs.read_locs(nm, path, stmt))
         ctx.bits |= ref
         ctx.spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
+        ctx.def_spans.append((path, range(stmt.lineno, stmt.end_lineno + 1)))
         ctx.why.append(f"{path}:{line} module-const {','.join(names)} n={ref.bit_count()}")
         return
 
@@ -663,7 +676,7 @@ def dict_entry_changes(old_tree, new_tree):
                     break
                 labels.add(lb)
             if ok and labels:
-                out[ost.lineno] = (key[1], labels)
+                out[ost.lineno] = (key[1], labels, key[0][-1])
     except Exception:  # noqa: BLE001
         return {}
     return out
@@ -917,6 +930,43 @@ class RefIndex:
                     elif isinstance(inner, ast.Name) and inner.id == name:
                         out[(inner.lineno, inner.col_offset)] = f"{site}!{j}"
         cache[name] = out
+        return out
+
+    def read_locs(self, name, path, stmt):
+        """[(path, range)] of every line that may read `name` (import lines excluded; a
+        default argument stands for its function's body). Over-approximates reads."""
+        key = ("locs", name, path, stmt.lineno)
+        if key in self._cache:
+            return self._cache[key]
+        pat = re.compile(r"\b" + re.escape(name) + r"\b")
+        defpat = re.compile(r"^\s*" + re.escape(name) + r"\s*(:[^=]*)?(=(?!=)|$)")
+        out = []
+        for ent in self._sources():
+            p, src = ent[0], ent[1]
+            if name not in src:
+                continue
+            if ent[2] is None:
+                ent[2] = [m.start() for m in _NL.finditer(src)]
+            nl = ent[2]
+            imports, headers = self._ast_info(ent)
+            for m in pat.finditer(src):
+                ln = bisect.bisect_left(nl, m.start()) + 1
+                if p == path and stmt.lineno <= ln <= stmt.end_lineno:
+                    continue
+                if ln in imports:
+                    continue
+                ls = nl[ln - 2] + 1 if ln > 1 else 0
+                le = nl[ln - 1] if ln - 1 < len(nl) else len(src)
+                text = src[ls:le]
+                if defpat.match(text) and len(pat.findall(text)) == 1:
+                    continue  # another class defining its own value is not a read
+                hdr = next((h for h in headers if h[0] <= ln <= h[1]), None)
+                if hdr is not None:
+                    # a default argument is bound at import time and read by the body
+                    out.append((p, range(hdr[2], hdr[3] + 1)))
+                    continue
+                out.append((p, range(ln, ln + 1)))
+        self._cache[key] = out
         return out
 
     def __call__(self, name, path, stmt, flip=False):

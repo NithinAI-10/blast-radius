@@ -51,14 +51,28 @@ costly to verify), packed onto the worker count that minimises each commit's cos
    values diverged can change outcome. Comparisons evaluated at import time are
    excluded from this rule.
 
-6. **TPC-DS shortcut** (`selector/tpcds_shortcut.py`, `tools/trace_phase.py`).
-   `test_execute_tpcds` parses and optimizes each query (~3 s in all), then
-   plans and runs it in pure Python (~27 s). We traced which lines this test runs
-   outside parse/optimize. When a patch touches none of them, a query whose
-   parsed input and optimized output fingerprint (`selector/canon.py`, independent
-   of sqlglot's own equality) match the pinned commit's must execute the same, so
-   only queries with a changed plan are executed. Queries run lazily, one at a
-   time, and the first failure stops the test.
+6. **TPC-DS shortcut** (`selector/tpcds_shortcut.py`, `tools/trace_phase2.py`,
+   `tools/trace_phase3.py`). `test_execute_tpcds` parses each query, optimizes it
+   inside the executor, runs it in pure Python and compares the rows with duckdb
+   running `transpile(sql, write="duckdb")` (~38 s CPU; parse 0.9 s, optimize 3.3 s,
+   transpile 0.5 s). On the pinned commit we traced the lines this test runs in each
+   phase: parse, optimize, transpile, and everything else (imports, class setup,
+   planning, execution, comparison). We also stored, per query, fingerprints of the
+   parsed input and optimized plan (`selector/canon.py`, independent of sqlglot's own
+   equality) and the duckdb SQL. When no changed line, and no line reading a changed
+   class attribute or module constant, runs in the "everything else" phase, a query
+   whose parsed input, plan and duckdb SQL all match the pinned commit's must run and
+   compare the same, so only queries where one of them changed are executed. Optimize
+   and transpile are re-run only when a changed line runs inside them; the CSV tables
+   load only if some query executes. Queries run lazily, one at a time, and the first
+   failure stops the test. Any non-Python or test-file change disables the shortcut. The shortcut is active only while
+   `test_execute_tpcds` runs; other tests in the same process are untouched.
+   For a changed class constant, table entry or required-argument flag, the question
+   is whether that class's own value is read in each phase, not whether its name
+   appears there: `tools/trace_tpcds_attrs.py` records, per phase, the class
+   constants, table entries (by defining class) and missing-argument validations the
+   test touches, and a table change also covers the tables that copy it with
+   `{**Parent.NAME, ...}`.
 
 7. **Verification** (`selector/runner.py`). Candidates whose running costs less
    than listing them are run with `unittest` in a forked child, against an
@@ -188,6 +202,11 @@ reads was edited gets one shared prior instead of its per-test one. It was measu
 same way, on the same 120 development mutants: 31 of the 32 such candidates failed,
 smoothed to (31 + 4·0.5) / (32 + 4). Like every prior, it only decides whether
 verifying such a test is worth the CPU, never whether the test is listed.
+
+**TPC-DS under the shortcut.** When the shortcut applies, `test_execute_tpcds` gets the
+prior 0.2 instead of its per-test 0.4: of the 120 development mutants, 3 made it a
+candidate with the shortcut applicable, and none failed it; smoothed like the others,
+(0 + 4·0.35) / (3 + 4). `tools/tpcds_prior.py` lists those cases.
 
 **How the planner uses them.** For each commit the selector estimates the cost of
 listing every candidate (`partition`) against verifying some of them:
