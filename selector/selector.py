@@ -48,7 +48,7 @@ DEFAULT_RATIO = 1.15
 # The scoring machines charge more CPU than the machine the CPU table was measured on
 # (practice runs: verifying more saved 6.6 s of simulated time but cost 8.7 s of CPU).
 # Every verification cost the planner weighs is multiplied by this.
-CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "0.8"))
+CPU_SCALE = float(os.environ.get("BR_CPU_SCALE", "0.5"))
 FIXTURE_PRIOR = (31 + 4 * 0.5) / (32 + 4)
 # test_execute_tpcds when the shortcut applies: 0 of the 3 such development mutants failed it;
 # smoothed like the per-test priors, (0 + 4 * 0.35) / (3 + 4)
